@@ -174,25 +174,86 @@ execute = function(request) {
         handle_message  <- identity
         handle_warning  <- identity
     } else {
+        # We only want a short error in the notebook/... because the usual case
+        # is just a problem in one of the display methods which are not relevant
+        # right now.
+        handle_display_error <- function(e) {
+            # This is used with withCallingHandler and only has two additional
+            # calls at the end instead of the 3 for tryCatch... (-2 at the end)
+            # we also remove the tryCatch and mime2repr stuff at the head of the callstack (+7)
+            calls <- head(sys.calls()[-seq_len(nframe + 7L)], -2)
+            stack_info <- format_stack(calls)
+            # TODO: replace with proper logging
+            msg <- sprintf('ERROR while rich displaying an object: %s\nTraceback:\n%s\n',
+                           toString(e),
+                           paste(stack_info, collapse='\n'))
+            cat(msg, file = stderror)
+            if (!silent) {
+                send_response('stream', request, 'iopub', list(
+                    name = 'stderr',
+                    text = msg))
+            }
+        }
         handle_value <- function(obj) {
+            log_debug('Handle value (cls: %s)', paste(class(obj), collapse=', '))
             data <- namedlist()
-            data[['text/plain']] <- repr_text(obj)
-            
-            # Only send a response when there is regular console output
-            if (nchar(data[['text/plain']]) > 0) {
-                if (getOption('jupyter.rich_display')) {
-                    tryCatch({
-                        for (mime in getOption('jupyter.display_mimetypes')) {
-                            r <- mime2repr[[mime]](obj)
-                            if (!is.null(r)) data[[mime]] <- r
-                        }
-                    }, error = handle_error)
+            metadata <- namedlist()
+
+            # We have to check the return value of print if it is visible and use the last object
+            # which is visible to compute the output from. There are a few packages which use print()
+            # to convert itself to something else (and don't output anything to the console) and the
+            # returned obj is then printed again.
+            print_return <<- list(visible = TRUE, value = obj)
+            send_even_if_no_print <- FALSE
+            while (print_return$visible) {
+                data[['text/plain']] <- paste(capture.output(print_return <<- withVisible(print(print_return$value))), collapse = '\n')
+                if (print_return$visible){
+                    log_debug('Found visible return from print (cls: %s)', paste(class(obj), collapse=', '))
+                    obj <- print_return$value
                 }
-                
+            }
+
+            # Sometimes, print(obj) does not print anything and we try to mimic that by not
+            # displaying anything in that case, even if our own repr_xxx functions would show
+            # something for the object.
+            if (nchar(data[['text/plain']]) > 0) {
+                log_debug('Nothing printed for value')
+                return()
+            }
+            
+            if (send_even_if_no_print || nchar(data[['text/plain']]) > 0) {
+                if (getOption('jupyter.rich_display')) {
+                    for (mime in getOption('jupyter.display_mimetypes')) {
+                        # Use withCallingHandlers as that shows the inner stacktrace:
+                        # https://stackoverflow.com/questions/15282471/get-stack-trace-on-trycatched-error-in-r
+                        # the tryCatch is  still needed to prevent the error from showing
+                        # up outside further up the stack :-/
+                        tryCatch({
+                            withCallingHandlers({
+                                r <- mime2repr[[mime]](obj)
+                                if (!is.null(r)) {
+                                    data[[mime]] <- r
+                                    # Isolating full html pages (putting them in an iframe)
+                                    if (identical(mime, 'text/html')) {
+                                        if (grepl("<html.*>", r, ignore.case = TRUE)){
+                                            jupyter_debug("Found full html page: %s", strtrim(r, 100))
+                                            metadata[[mime]] <- list(isolated = TRUE)
+                                        }
+                                    }
+                                }
+                            }, error = handle_display_error)
+                        }, error = function(x) {})
+                    }
+                }
+                jupyter_debug("Sending display_data: %s", paste(capture.output(str(data)), collapse = "\n"))
                 send_response('display_data', request, 'iopub', list(
                     data = data,
-                    metadata = namedlist() ))
+                    metadata = metadata))
             }
+            log_debug('Sending display_data: %s', paste(capture.output(str(data)), collapse = '\n'))
+            send_response('display_data', request, 'iopub', list(
+                data = data,
+                metadata = metadata))
         }
         
         stream <- function(output, streamname) {
@@ -229,6 +290,7 @@ execute = function(request) {
     interrupted <<- FALSE
     last_recorded_plot <<- NULL
     
+    log_debug('Executing: %s', strtrim(request$content$code, 100))
     tryCatch(
         evaluate(
             request$content$code,
@@ -239,6 +301,7 @@ execute = function(request) {
         error = handle_error) # evaluate does not catch errors in parsing
     
     if ((!silent) & (!is.null(last_recorded_plot))) {
+        log_debug('Sending a plot')
         send_plot(last_recorded_plot)
     }
     
