@@ -30,6 +30,7 @@ Imports:
 Collate:
     'class_unions.r'
     'logging.r'
+    'inspector.r'
     'comm_manager.r'
     'compat.r'
     'environment_runtime.r'

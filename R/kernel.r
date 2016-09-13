@@ -6,6 +6,7 @@ Kernel <- setRefClass(
         zmqctx          = 'externalptr',
         sockets         = 'list',
         executor        = 'Executor',
+        inspector       = 'Inspector',
         comm_manager    = 'CommManager'),
     methods = list(
 
@@ -116,6 +117,7 @@ handle_shell = function() {
         comm_open           = comm_manager$on_comm_open(msg),
         comm_msg            = comm_manager$on_comm_msg(msg),
         comm_close          = comm_manager$on_comm_close(msg),
+        inspect_request     = inspector$inspect(msg),
         execute_request     = executor$execute(msg),
         kernel_info_request = kernel_info(msg),
         history_request     = history(msg),
@@ -308,12 +310,14 @@ initialize = function(connection_file) {
 
     executor <<- Executor$new(send_response = .self$send_response,
         abort_queued_messages = .self$abort_queued_messages)
+    inspector <<- Inspector$new(send_response = .self$send_response)
     comm_manager <<- CommManager$new(send_response = .self$send_response)
     runtime_env$comm_manager <- comm_manager
 },
 
 run = function() {
     options(jupyter.in_kernel = TRUE)
+    options(jupyter.log_level = 3L)
     while (TRUE) {
         log_debug('main loop: beginning')
         zmq.poll(
